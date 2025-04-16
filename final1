@@ -1,0 +1,283 @@
+import requests
+import os
+import re
+import string
+import sys
+import types
+import pickle
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
+import pytesseract
+from langdetect import detect
+from googletrans import Translator
+from newspaper import Article
+import joblib
+import spacy
+import wikipedia
+
+# Load vectorizer and ML model
+vectorizer = joblib.load("/content/tfidf_vectorizer.pkl")  # Load the vectorizer
+model = joblib.load("/content/fake_news_model.pkl")        # Load the model
+
+# Initialize spaCy model for NER
+nlp = spacy.load("en_core_web_sm")
+
+# API keys
+GNEWS_API_KEY = '7e4d9ca0e7da5657ee6d315ed685294f'
+NEWSDATA_API_KEY = 'pub_808719d3a7e14abc5c7c535173fb2af6a2c6e'
+
+# Initialize translator
+translator = Translator()
+
+# ------------------- OCR Extraction ---------------------
+def extract_text_from_image(image_path):
+    try:
+        img = cv2.imread(image_path)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        resized = cv2.resize(thresh, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_LINEAR)
+        pil_img = Image.fromarray(resized)
+        text = pytesseract.image_to_string(pil_img, lang='eng', config='--psm 6')
+        return text.strip()
+    except Exception as e:
+        print(f"OCR error: {e}")
+        return None
+
+# ------------------- URL Text Extraction ---------------------
+def extract_text_from_url(url):
+    try:
+        article = Article(url)
+        article.download()
+        article.parse()
+        return article.text
+    except:
+        return None
+
+# ------------------- Language Detection & Translation ---------------------
+def detect_language(text):
+    try:
+        return detect(text)
+    except:
+        return "unknown"
+
+def translate_to_english(text):
+    try:
+        result = translator.translate(text, dest='en')
+        print(f"[DEBUG] Translated '{text[:30]}...' to '{result.text[:30]}...'")
+        return result.text
+    except Exception as e:
+        print(f"[Translation Error] {e}")
+        return text
+
+# ------------------- Input Handling ---------------------
+def smart_input_handler(user_input):
+    if user_input.startswith("http"):
+        text = extract_text_from_url(user_input)
+        return text or "Could not extract text from the URL."
+    elif user_input.endswith((".jpg", ".jpeg", ".png")) and os.path.exists(user_input):
+        text = extract_text_from_image(user_input)
+        return text or "Could not read text from image."
+    else:
+        return user_input
+
+# ------------------- Preprocessing ---------------------
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r"http\S+", "", text)
+    text = re.sub(r"\d+", "", text)
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    return text
+
+def preprocess_for_model(text):
+    lang = detect_language(text)
+    original = text
+    if lang != 'en':
+        translated = translate_to_english(text)
+        print(f"[INFO] Translated from {lang} to English.")
+        text = translated
+    cleaned = clean_text(text)
+    return cleaned, lang, original
+
+# ------------------- External News Checks ---------------------
+def gnews_check(text):
+    url = f"https://gnews.io/api/v4/search?q={text}&token={GNEWS_API_KEY}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        articles = response.json().get("articles", [])
+        if articles:
+            return f"Found related news on GNews: {articles[0]['title']}"
+    return None
+
+def newsdata_check(text):
+    url = f"https://newsdata.io/api/1/news?apikey={NEWSDATA_API_KEY}&q={text}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        articles = response.json().get("results", [])
+        if articles:
+            return f"Found similar news on NewsData: {articles[0]['title']}"
+    return None
+
+# ------------------- Fact-Checking with NER ---------------------
+def check_fact_with_ner(text):
+    doc = nlp(text)
+    for ent in doc.ents:
+        if ent.label_ in ['PERSON', 'ORG', 'GPE']:
+            try:
+                page = wikipedia.page(ent.text)
+                return True, f"Entity {ent.text} found on Wikipedia"
+            except wikipedia.exceptions.DisambiguationError:
+                return False, f"Multiple entities found for {ent.text}"
+            except wikipedia.exceptions.HTTPError:
+                return False, f"Entity {ent.text} not found on Wikipedia"
+    return False, "No entity found"
+
+# ------------------- New: Verify Political Claim ---------------------
+def verify_political_claim(text):
+    """
+    Checks if a claim about a political position is correct.
+    """
+    patterns = [
+        # "X is the Y of Z" pattern
+        re.compile(r"(\b[\w\s]+\b) (?:is|was|are|were) the (\b[\w\s]+\b) of (\b[\w\s]+\b)", re.IGNORECASE),
+        # "X is Z's Y" pattern
+        re.compile(r"(\b[\w\s]+\b) (?:is|was|are|were) (\b[\w\s]+\b)'s (\b[\w\s]+\b)", re.IGNORECASE)
+    ]
+    
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match:
+            entity, position, region = match.groups()
+            # Clean extracted strings
+            entity = entity.strip()
+            position = position.strip()
+            region = region.strip()
+            
+            # Handle common misspellings
+            region = region.replace("tamilnady", "tamil nadu")
+            
+            print(f"[DEBUG] Extracted claim: {entity} is the {position} of {region}")
+            
+            # Check for specific political positions
+            if "chief minister" in position.lower() or "cm" == position.lower():
+                try:
+                    # Try to get information about the region
+                    region_info = wikipedia.summary(f"Chief Minister of {region}", sentences=3)
+                    # Check if entity is mentioned as the current CM
+                    if entity.lower() in region_info.lower():
+                        return True, f"{entity} is verified as {position} of {region}"
+                    else:
+                        return False, f"{entity} is NOT the {position} of {region} based on Wikipedia"
+                except:
+                    # If specific search fails, try broader search
+                    try:
+                        region_info = wikipedia.summary(region, sentences=5)
+                        # Look for patterns like "Chief Minister [name]" or "[name] is the Chief Minister"
+                        cm_pattern = re.compile(f"chief minister.*?{entity.lower()}|{entity.lower()}.*?chief minister", re.IGNORECASE)
+                        if cm_pattern.search(region_info):
+                            return True, f"{entity} is verified as {position} of {region}"
+                        else:
+                            return False, f"{entity} is NOT the {position} of {region} based on Wikipedia"
+                    except:
+                        pass
+            
+            # Check for Prime Minister position
+            if "prime minister" in position.lower() or "pm" == position.lower():
+                try:
+                    # Check if the person is the current PM of the country
+                    pm_info = wikipedia.summary("Prime Minister of India", sentences=3)
+                    if entity.lower() in pm_info.lower():
+                        if region.lower() != "india":
+                            return False, f"{entity} is the Prime Minister of India, NOT {region}"
+                        return True, f"{entity} is verified as Prime Minister of India"
+                    else:
+                        return False, f"{entity} is NOT the Prime Minister of India based on Wikipedia"
+                except:
+                    pass
+    
+    # No pattern matched or verification failed
+    return None, "Could not verify political claim"
+
+# ------------------- Prediction Engine ---------------------
+def predict_news(raw_input):
+    # Step 1: Process Input
+    content = smart_input_handler(raw_input)
+    if content.startswith("Could not"):
+        return {"error": content}
+
+    # Step 2: Check for political claims FIRST
+    is_political_claim, political_message = verify_political_claim(content)
+    if is_political_claim is False:  # Explicitly check for False (not None)
+        return {
+            "original_text": raw_input,
+            "prediction": "Fake (Factual inaccuracy detected)",
+            "confidence": 100,
+            "verification": political_message
+        }
+    elif is_political_claim is True:
+        return {
+            "original_text": raw_input,
+            "prediction": "Real (Verified political claim)",
+            "confidence": 100,
+            "verification": political_message
+        }
+
+    # Step 3: Check for Known Facts using NER only if political verification was inconclusive
+    is_verified, message = check_fact_with_ner(content)
+    if is_verified:
+        # Don't immediately trust NER verification for political claims
+        if "chief minister" in content.lower() or "prime minister" in content.lower():
+            # For political claims, NER alone is not sufficient
+            pass
+        else:
+            return {
+                "original_text": raw_input,
+                "prediction": "Real (Verified via NER)",
+                "confidence": 100,
+                "verification": message
+            }
+
+    # Step 4: Proceed with Model Prediction if verification was inconclusive
+    processed_text, lang, original = preprocess_for_model(content)
+    vec = vectorizer.transform([processed_text])
+    prediction = model.predict(vec)[0]
+    confidence = model.predict_proba(vec).max() * 100
+    label = "Real" if prediction == 1 else "Fake"
+
+    # Step 5: External Checks
+    external_results = []
+    gnews_result = gnews_check(original)
+    newsdata_result = newsdata_check(original)
+    external_results = list(filter(None, [gnews_result, newsdata_result]))
+    
+    # For political claims that weren't verified earlier, be more cautious
+    if "chief minister" in content.lower() or "prime minister" in content.lower():
+        if label == "Real" and not external_results:
+            label = "Suspicious (Political claim needs verification)"
+    
+    if external_results and label == "Fake":
+        label = "Possibly Real (verified externally)"
+
+    return {
+        "original_text": original,
+        "prediction": label,
+        "confidence": round(confidence, 2),
+        "verification": "No official source confirmation" if not external_results else external_results[0]
+    }
+
+# ------------------- Demo ---------------------
+if __name__ == "__main__":
+    user_input = input("Paste news text / URL / image path: ")
+    result = predict_news(user_input)
+
+    if "error" in result:
+        print(result["error"])
+    else:
+        print("\n--- Prediction Report ---")
+        print("Original Text:", result["original_text"])
+        print("Prediction:", result["prediction"])
+        print("Confidence:", result["confidence"], "%")
+        print("External Verification:", result["verification"])
